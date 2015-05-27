@@ -1,0 +1,43 @@
+{
+  "name": "verquire-cli",
+  "author": {
+    "name": "Tomasz Janczuk <tomasz@janczuk.org>",
+    "url": "http://tomasz.janczuk.org",
+    "twitter": "tjanczuk"
+  },
+  "version": "0.1.0",
+  "description": "Installs modules for use with verquire",
+  "tags": [
+    "auth0",
+    "require",
+    "npm",
+    "semver"
+  ],
+  "engines": {
+    "node": ">= 0.10"
+  },
+  "licenses": [
+    {
+      "type": "Apache",
+      "url": "http://www.apache.org/licenses/LICENSE-2.0"
+    }
+  ],
+  "dependencies": {
+    "async": "^0.9.0",
+    "bunyan": "^1.3.5",
+    "commander": "^2.8.1",
+    "glob": "^5.0.10",
+    "rimraf": "^2.3.4"
+  },
+  "bin": {
+    "verquire": "./bin/verquire-cli"
+  },
+  "homepage": "http://github.com/auth0/verquire-cli",
+  "repository": {
+    "type": "git",
+    "url": "git@github.com:auth0/verquire-cli.git"
+  },
+  "bugs": {
+    "url": "http://github.com/auth0/verquire-cli/issues"
+  }
+}
