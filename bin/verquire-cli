@@ -17,12 +17,21 @@ program
     .version(require(path.join(__dirname, '..', 'package.json')).version);
 
 program
-    .command('create <verquire_dir>')
+    .command('install <verquire_dir>')
     .description('install Node.js modules for use by verquire')
     .option('-s --spec <package_spec>', 'package spec file')
     .option('-e --errors <out_file>', 'package spec file for modules that failed to install')
     .option('-c --concurrent <limit>', 'limit concurrent module installations', parseInt, 4)
-    .action(verquire_action);
+    .action(install_action);
+
+program
+    .command('update-spec')
+    .description('update package spec with latest module versions')
+    .option('-s --spec <package_spec>', 'input package spec file')
+    .option('-o --out <out_file>', 'updated package spec file')
+    .option('-e --errors <error_file>', 'package spec file for modules that failed to install')
+    .option('-c --concurrent <limit>', 'limit concurrent module installations', parseInt, 4)
+    .action(update_action);
 
 
 program.parse(process.argv);
@@ -32,7 +41,7 @@ if (!process.argv.slice(2).length) {
     process.exit(1);
 }
 
-function verquire_action(verquire_dir, options) {
+function install_action(verquire_dir, options) {
     options.spec = options.spec || path.join(__dirname, 'packages.json');
 
     logger.info({ 
@@ -232,7 +241,101 @@ function verquire_action(verquire_dir, options) {
             process.exit(2);
         }
         else {
+            fs.writeFileSync(path.join(verquire_dir, 'packages.json'), JSON.stringify(spec, null, 2), 'utf8');
             logger.info('finished with no errors');
+        }
+    });
+}
+
+
+function update_action(options) {
+    options.spec = options.spec || path.join(__dirname, 'packages.json');
+
+    logger.info({ 
+        spec: options.spec, 
+        concurrent: options.concurrent
+    }, 'udpate-spec start');
+
+    var spec = require(options.spec);
+    var errors = {};
+    async.eachLimit(Object.keys(spec), options.concurrent, function (name, callback) {
+        var npm_info = '';
+        async.series([
+            function (callback) {
+                // run npm to get the the spec version
+                var npm = spawn('npm', ['view', name, '--json'], {
+                    env: process.env,
+                    stdio: [process.stdin, 'pipe', process.stderr]
+                });
+                npm.stdout.on('data', function (d) { npm_info += d; });
+                npm.once('close', function (code) {
+                    code ? npm.emit('done', new Error('npm exit code ' + code)) : npm.emit('done');
+                });
+                npm.once('error', function (e) { npm.emit('done', e); });
+                npm.once('done', callback);
+            },
+            function (callback) {
+                try {
+                    npm_info = JSON.parse(npm_info);
+                }
+                catch (e) {
+                    return callback(e);
+                }
+                var present = false;
+                for (var i = 0; i < spec[name].length; i++) {
+                    if (spec[name][i] === npm_info.version) {
+                        present = true;
+                        break;
+                    }
+                }
+                if (present) {
+                    logger.info({ 
+                        latest: npm_info.version, 
+                        module: name 
+                    }, 'module is up to date');
+                }
+                else {
+                    logger.info({ 
+                        latest: npm_info.version, 
+                        module: name 
+                    }, 'adding latest module version');
+                    spec[name].unshift(npm_info.version);
+                }
+                callback();
+            },
+        ], function (error) {
+            if (error) {
+                logger.error({ 
+                    error: (error.message || error.stack || error.toString()),
+                    module: name
+                }, 'error inspecting a module');
+                errors[name] = error instanceof Error ? error.message : error;
+                callback();
+            }
+            else {
+                logger.info({
+                    module: name
+                }, 'updated module');
+                callback();
+            }
+        });
+    }, function (error) {
+        if (error) {
+            logger.error(error);
+            process.exit(1);
+        }
+        if (Object.keys(errors).length > 0) {
+            logger.error(errors, 'failed to update some modules');
+            if (options.errors) {
+                fs.writeFileSync(options.errors, JSON.stringify(errors, null, 2), 'utf8');
+            }
+            process.exit(2);
+        }
+        else {
+            if (options.out) {
+                fs.writeFileSync(options.out, JSON.stringify(spec, null, 2), 'utf8');
+            }
+            logger.info(spec, 'finished with no errors');
         }
     });
 }
