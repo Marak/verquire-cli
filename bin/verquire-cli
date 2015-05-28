@@ -7,6 +7,7 @@ var program = require('commander')
     , fs = require('fs')
     , rmdir = require('rimraf')
     , glob = require('glob')
+    , semver = require('semver')
     , logger = require('bunyan').createLogger({ name: 'verquire' });
 
 function parseInt(val, def) {
@@ -21,6 +22,8 @@ program
     .description('install Node.js modules for use by verquire')
     .option('-s --spec <package_spec>', 'package spec file')
     .option('-e --errors <out_file>', 'package spec file for modules that failed to install')
+    .option('-t --tests <test_file>', 'custom smoke tests for modules')
+    .option('-k --keep', 'keep artifacts of modules that failed installing')
     .option('-c --concurrent <limit>', 'limit concurrent module installations', parseInt, 4)
     .action(install_action);
 
@@ -33,6 +36,19 @@ program
     .option('-c --concurrent <limit>', 'limit concurrent module installations', parseInt, 4)
     .action(update_action);
 
+program
+    .command('blacklist-spec')
+    .description('update package spec by removing blacklisted modules')
+    .option('-s --spec <package_spec>', 'input package spec file')
+    .option('-b --blacklist <blacklist_file>', 'blacklist spec file')
+    .option('-o --out <out_file>', 'updated package spec file')
+    .action(blacklist_action);
+
+program
+    .command('node-modules <verquire_dir> <node_modules_dir>')
+    .description('populate node_modules using default versions of verquire modules')
+    .action(node_modules_action);
+
 
 program.parse(process.argv);
 
@@ -40,6 +56,54 @@ if (!process.argv.slice(2).length) {
     program.outputHelp();
     process.exit(1);
 }
+
+function node_modules_action(verquire_dir, node_modules_dir, options) {
+    logger.info({ 
+        spec: options.spec, 
+        concurrent: options.concurrent, 
+        verquire_dir: verquire_dir
+    }, 'node-modules start');
+
+    if (!fs.existsSync(verquire_dir)) {
+        logger.error({ verquire_dir: verquire_dir }, 'directory does not exists');
+        process.exit(1);
+    }
+
+    if (!fs.existsSync(node_modules_dir)) {
+        logger.error({ node_modules_dir: node_modules_dir }, 'directory does not exists');
+        process.exit(1);
+    }
+
+    var spec = require(path.join(path.resolve(verquire_dir), 'packages.json'));
+
+    async.eachLimit(Object.keys(spec), 10, function (name, callback) {
+        var src = path.join(path.resolve(verquire_dir), name, spec[name][0], 'node_modules', name);
+        var dest = path.join(path.resolve(node_modules_dir), name);
+        fs.rmdir(dest, function () {
+            fs.symlink(src, dest, function (error) {
+                if (error) {
+                    logger.error({
+                        error: error.message || error.toString(),
+                        src: src, 
+                        dest: dest, 
+                        module: name + '@' + spec[name][0]
+                    }, 'error linking module');
+                }
+                else {
+                    logger.info({
+                        src: src, 
+                        dest: dest, 
+                        module: name + '@' + spec[name][0]
+                    }, 'linked module');
+                }
+                callback(error);
+            });
+        });
+    }, function (error) {
+        if (error) process.exit(1);
+    });
+}
+
 
 function install_action(verquire_dir, options) {
     options.spec = options.spec || path.join(__dirname, 'packages.json');
@@ -55,7 +119,8 @@ function install_action(verquire_dir, options) {
         process.exit(1);
     }
 
-    var spec = require(options.spec);
+    var spec = require(path.resolve(options.spec));
+    var tests = options.tests ? require(path.resolve(options.tests)) : {};
 
     var errors = {};
     var cache = {};
@@ -88,7 +153,7 @@ function install_action(verquire_dir, options) {
                 },
                 function (callback) {
                     // run npm to get the specific version
-                    var npm = spawn('npm', ['i', name + '@' + version], {
+                    var npm = spawn('npm', ['i', '--production', name + '@' + version], {
                         env: process.env,
                         cwd: verdir,
                         stdio: 'inherit'
@@ -191,7 +256,8 @@ function install_action(verquire_dir, options) {
                 },
                 function (callback) {
                     // validate installation
-                    var node = spawn('node', ['-e', 'require("' + name + '");'], {
+                    var test = tests[name] || ('require("' + name + '");');
+                    var node = spawn('node', ['-e', test], {
                         env: process.env,
                         cwd: verdir,
                         stdio: 'inherit'
@@ -206,16 +272,20 @@ function install_action(verquire_dir, options) {
                 if (error) {
                     logger.error({ 
                         error: (error.message || error.stack || error.toString()),
+                        location: verdir,
                         module: name + '@' + version
                     }, 'error installing');
                     errors[name] = errors[name] || {};
                     errors[name][version] = error instanceof Error ? error.message : error;
-                    rmdir(verdir, function () {
-                        // remove module subdirectory if empty
-                        fs.rmdir(path.join(verquire_dir, name), function () {
-                            callback();
+                    if (options.keep)
+                        return callback();
+                    else
+                        rmdir(verdir, function () {
+                            // remove module subdirectory if empty
+                            fs.rmdir(path.join(verquire_dir, name), function () {
+                                callback();
+                            });
                         });
-                    });
                 }
                 else {
                     logger.info({
@@ -231,13 +301,14 @@ function install_action(verquire_dir, options) {
             process.exit(1);
         }
         if (Object.keys(errors).length > 0) {
-            logger.error(errors, 'some modules failed to install');
+            logger.error({ count: Object.keys(errors).length }, 'some modules failed to install');
             if (options.errors) {
-                for (var name in errors) {
-                    errors[name] = Object.keys(errors[name]);
-                }
+                logger.error({ error: options.error }, 'writing error file');
                 fs.writeFileSync(options.errors, JSON.stringify(errors, null, 2), 'utf8');
+
             }
+            else 
+                logger.error(errors, 'modules failed installing');
             process.exit(2);
         }
         else {
@@ -245,6 +316,46 @@ function install_action(verquire_dir, options) {
             logger.info('finished with no errors');
         }
     });
+}
+
+function blacklist_action(options) {
+    options.spec = options.spec || path.join(__dirname, 'packages.json');
+
+    logger.info({ 
+        spec: options.spec, 
+        blacklist: options.blacklist
+    }, 'blacklist-spec start');
+
+    var spec = require(path.resolve(options.spec));
+    var blacklist = options.blacklist ? require(path.resolve(options.blacklist)) : {};
+
+    for (var name in blacklist) {
+        if (spec[name]) {
+            var i = 0;
+            while (i < spec[name].length) {
+                if (semver.satisfies(spec[name][i], blacklist[name].v)) {
+                    logger.info({
+                        module: name + '@' + spec[name][i]
+                    }, 'removing module version');
+                    spec[name].splice(i, 1);
+                }
+                else
+                    i++;
+            }
+            if (spec[name].length === 0) {
+                logger.info({
+                    module: name
+                }, 'removing module');
+                delete spec[name];
+            }
+        }
+    }
+
+    if (options.out) {
+        fs.writeFileSync(options.out, JSON.stringify(spec, null, 2), 'utf8');
+        logger.info({ out: options.out }, 'writing output file');
+    }
+    logger.info('finished with no errors');
 }
 
 
@@ -256,7 +367,7 @@ function update_action(options) {
         concurrent: options.concurrent
     }, 'udpate-spec start');
 
-    var spec = require(options.spec);
+    var spec = require(path.resolve(options.spec));
     var errors = {};
     async.eachLimit(Object.keys(spec), options.concurrent, function (name, callback) {
         var npm_info = '';
