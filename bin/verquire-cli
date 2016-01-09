@@ -4,6 +4,7 @@ var program = require('commander')
     , async = require('async')
     , path = require('path')
     , spawn = require('child_process').spawn
+    , execSync = require('child_process').execSync
     , fs = require('fs')
     , rmdir = require('rimraf')
     , glob = require('glob')
@@ -23,7 +24,9 @@ program
     .option('-s --spec <package_spec>', 'package spec file')
     .option('-e --errors <out_file>', 'package spec file for modules that failed to install')
     .option('-t --tests <test_file>', 'custom smoke tests for modules')
+    .option('-u --fixup <fixup_file>', 'custom fixup per module')
     .option('-k --keep', 'keep artifacts of modules that failed installing')
+    .option('-r --error', 'quit on first error')
     .option('-c --concurrent <limit>', 'limit concurrent module installations', parseInt, 4)
     .action(install_action);
 
@@ -121,6 +124,7 @@ function install_action(verquire_dir, options) {
 
     var spec = require(path.resolve(options.spec));
     var tests = options.tests ? require(path.resolve(options.tests)) : {};
+    var fixups = options.fixup ? require(path.resolve(options.fixup)) : {};
 
     var errors = {};
     var cache = {};
@@ -181,7 +185,8 @@ function install_action(verquire_dir, options) {
 
                         logger.info({
                             count: list.length,
-                            module: name + '@' + version
+                            module: name + '@' + version,
+                            path: verdir
                         }, 'inspecting dependencies');
 
                         var exclude_paths = [];
@@ -191,7 +196,7 @@ function install_action(verquire_dir, options) {
                             var module_path = path.join(package_json, '..');
                             var exclude = false;
                             for (var k = 0; k < exclude_paths.length; k++) {
-                                if (module_path.indexOf(exclude_paths[k]) === 0) {
+                                if (module_path === exclude_paths[k] || module_path.indexOf(exclude_paths[k]) === 0 && module_path[exclude_paths[k].length] === '/') {
                                     exclude = true;
                                     break;
                                 }
@@ -213,6 +218,7 @@ function install_action(verquire_dir, options) {
                                 continue;
                             }
                             var module_name = json.name + '@' + json.version;
+
                             if (cache[module_name]) {
                                 // module is already installed; create symlink
                                 try {
@@ -243,7 +249,20 @@ function install_action(verquire_dir, options) {
                                 exclude_paths.push(module_path);
                             }
                             else {
-                                // module not installed yet, add to cache
+                                // module not installed yet, apply fixups and add to cache
+
+                                if (fixups[module_name]) {
+                                    logger.info({ 
+                                        name: module_name, 
+                                        path: module_path, 
+                                        fixup: fixups[module_name] 
+                                    }, 'applying fixups');
+                                    console.log(execSync(fixups[module_name], {
+                                        env: process.env,
+                                        cwd: module_path
+                                    }));
+                                }
+
                                 logger.info({ 
                                     module: module_name, 
                                     path: module_path
@@ -257,6 +276,7 @@ function install_action(verquire_dir, options) {
                 function (callback) {
                     // validate installation
                     var test = tests[name] || ('require("' + name + '");');
+                    logger.info({ name: name, test: test }, 'testing module')
                     var node = spawn('node', ['-e', test], {
                         env: process.env,
                         cwd: verdir,
@@ -278,12 +298,12 @@ function install_action(verquire_dir, options) {
                     errors[name] = errors[name] || {};
                     errors[name][version] = error instanceof Error ? error.message : error;
                     if (options.keep)
-                        return callback();
+                        return callback(options.error ? error : undefined);
                     else
                         rmdir(verdir, function () {
                             // remove module subdirectory if empty
                             fs.rmdir(path.join(verquire_dir, name), function () {
-                                callback();
+                                callback(options.error ? error : undefined);
                             });
                         });
                 }
