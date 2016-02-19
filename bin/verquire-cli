@@ -171,10 +171,10 @@ function install_action(verquire_dir, options) {
                     npm.once('done', callback);
                 },
                 function (callback) {
-                    if (skipopt.indexOf(module_name) > -1) {
+                    if (skipopt.indexOf(name + '@' + version) > -1) {
                         // skip optimizing submodules of this module
                         logger.info({
-                            module: module_name,
+                            module: name + '@' + version,
                             path: verdir
                         }, 'skipping inspecting dependencies');
                         return callback();

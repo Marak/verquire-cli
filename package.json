@@ -5,7 +5,7 @@
     "url": "http://tomasz.janczuk.org",
     "twitter": "tjanczuk"
   },
-  "version": "0.4.1-pre",
+  "version": "0.4.1",
   "description": "Installs modules for use with verquire",
   "tags": [
     "auth0",
