@@ -159,7 +159,7 @@ function install_action(verquire_dir, options) {
                 },
                 function (callback) {
                     // run npm to get the specific version
-                    var npm = spawn('npm', ['i', '--production', name + '@' + version], {
+                    var npm = spawn('npm', ['i', '--production', '--unsafe-perm', name + '@' + version], {
                         env: process.env,
                         cwd: verdir,
                         stdio: 'inherit'
