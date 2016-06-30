@@ -180,8 +180,7 @@ function install_action(verquire_dir, options) {
                         return callback();
                     }
                     // minimize size by reusing modules with symlinks
-                    glob('package.json', {
-                        matchBase: true,
+                    glob('**/node_modules/*/package.json', {
                         nodir: true,
                         cwd: verdir
                     }, function (error, list) {
