@@ -84,24 +84,41 @@ function node_modules_action(verquire_dir, node_modules_dir, options) {
         var src = path.join(path.resolve(verquire_dir), name, spec[name][0], 'node_modules', name);
         var dest = path.join(path.resolve(node_modules_dir), name);
         fs.rmdir(dest, function () {
-            fs.symlink(src, dest, function (error) {
-                if (error) {
-                    logger.error({
-                        error: error.message || error.toString(),
-                        src: src, 
-                        dest: dest, 
-                        module: name + '@' + spec[name][0]
-                    }, 'error linking module');
+            async.series([
+                function (cb) {
+                    // For complex module names like @kikinteractive/kik, 
+                    // ensure the destination directory structure is created 
+                    // up to the second to last element of the directory path
+                    var structure = name.split('/');
+                    structure.splice(structure.length - 1);
+                    if (!structure.length) return cb();
+                    var subpath = path.resolve(node_modules_dir);
+                    async.eachSeries(structure, function (p, cb) {
+                        subpath = path.join(subpath, p);
+                        fs.mkdir(subpath, () => cb());
+                    }, cb);
+                },
+                function (cb) {
+                    fs.symlink(src, dest, function (error) {
+                        if (error) {
+                            logger.error({
+                                error: error.message || error.toString(),
+                                src: src, 
+                                dest: dest, 
+                                module: name + '@' + spec[name][0]
+                            }, 'error linking module');
+                        }
+                        else {
+                            logger.info({
+                                src: src, 
+                                dest: dest, 
+                                module: name + '@' + spec[name][0]
+                            }, 'linked module');
+                        }
+                        cb(error);
+                    });                    
                 }
-                else {
-                    logger.info({
-                        src: src, 
-                        dest: dest, 
-                        module: name + '@' + spec[name][0]
-                    }, 'linked module');
-                }
-                callback(error);
-            });
+            ], callback);
         });
     }, function (error) {
         if (error) process.exit(1);
@@ -151,11 +168,14 @@ function install_action(verquire_dir, options) {
                 },
                 function (callback) {
                     // create directory structure for versioned module
-                    fs.mkdir(path.join(verquire_dir, name), function () {
-                        fs.mkdir(verdir, function () {
-                            fs.mkdir(path.join(verdir, 'node_modules'), callback);
-                        });
-                    });
+                    var structure = name.split('/');
+                    structure.push(version);
+                    structure.push('node_modules');
+                    var subpath = verquire_dir;
+                    async.eachSeries(structure, function (p, cb) {
+                        subpath = path.join(subpath, p);
+                        fs.mkdir(subpath, () => cb());
+                    }, callback);
                 },
                 function (callback) {
                     // run npm to get the specific version
