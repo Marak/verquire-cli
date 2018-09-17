@@ -11,10 +11,12 @@ var program = require('commander')
     , semver = require('semver')
     , logger = require('bunyan').createLogger({ name: 'verquire' });
 
+const npm_bin = require.resolve(`npm/${require('npm/package.json').bin.npm}`);
+
 function parseInt(val, def) {
     return isNaN(val) ? def : +val;
 }
- 
+
 program
     .version(require(path.join(__dirname, '..', 'package.json')).version);
 
@@ -23,6 +25,7 @@ program
     .description('install Node.js modules for use by verquire')
     .option('-s --spec <package_spec>', 'package spec file')
     .option('-e --errors <out_file>', 'package spec file for modules that failed to install')
+    .option('-i --incremental', 'support an incremental build where an existing verquire directory is preserved')
     .option('-t --tests <test_file>', 'custom smoke tests for modules')
     .option('-u --fixup <fixup_file>', 'custom fixup per module')
     .option('-p --skipopt <skipopt_file>', 'array of modules to skip optimization for')
@@ -50,6 +53,7 @@ program
 
 program
     .command('node-modules <verquire_dir> <node_modules_dir>')
+    .option('-i --incremental', 'support adding new module versions to node_modules')
     .description('populate node_modules using default versions of verquire modules')
     .action(node_modules_action);
 
@@ -62,9 +66,10 @@ if (!process.argv.slice(2).length) {
 }
 
 function node_modules_action(verquire_dir, node_modules_dir, options) {
-    logger.info({ 
-        spec: options.spec, 
-        concurrent: options.concurrent, 
+    logger.info({
+        spec: options.spec,
+        concurrent: options.concurrent,
+        incremental: options.incremental,
         verquire_dir: verquire_dir
     }, 'node-modules start');
 
@@ -86,8 +91,8 @@ function node_modules_action(verquire_dir, node_modules_dir, options) {
         fs.rmdir(dest, function () {
             async.series([
                 function (cb) {
-                    // For complex module names like @kikinteractive/kik, 
-                    // ensure the destination directory structure is created 
+                    // For complex module names like @kikinteractive/kik,
+                    // ensure the destination directory structure is created
                     // up to the second to last element of the directory path
                     var structure = name.split('/');
                     structure.splice(structure.length - 1);
@@ -101,22 +106,33 @@ function node_modules_action(verquire_dir, node_modules_dir, options) {
                 function (cb) {
                     fs.symlink(src, dest, function (error) {
                         if (error) {
+                            if (options.incremental && error.code === 'EEXIST') {
+                                logger.info({
+                                    src: src,
+                                    dest: dest,
+                                    module: name + '@' + spec[name][0]
+                                }, 'skipping existing default module');
+
+                                return cb();
+                            }
+
                             logger.error({
                                 error: error.message || error.toString(),
-                                src: src, 
-                                dest: dest, 
+                                src: src,
+                                dest: dest,
                                 module: name + '@' + spec[name][0]
                             }, 'error linking module');
+
+                            return cb(error);
                         }
-                        else {
-                            logger.info({
-                                src: src, 
-                                dest: dest, 
-                                module: name + '@' + spec[name][0]
-                            }, 'linked module');
-                        }
-                        cb(error);
-                    });                    
+
+                        logger.info({
+                            src: src,
+                            dest: dest,
+                            module: name + '@' + spec[name][0]
+                        }, 'linked module');
+                        cb();
+                    });
                 }
             ], callback);
         });
@@ -129,9 +145,11 @@ function node_modules_action(verquire_dir, node_modules_dir, options) {
 function install_action(verquire_dir, options) {
     options.spec = options.spec || path.join(__dirname, 'packages.json');
 
-    logger.info({ 
-        spec: options.spec, 
-        concurrent: options.concurrent, 
+    verquire_dir = path.resolve(process.cwd(), verquire_dir);
+
+    logger.info({
+        spec: options.spec,
+        concurrent: options.concurrent,
         verquire_dir: verquire_dir
     }, 'verquire start');
 
@@ -147,231 +165,302 @@ function install_action(verquire_dir, options) {
 
     var errors = {};
     var cache = {};
-    async.eachLimit(Object.keys(spec), options.concurrent, function (name, callback) {
-        async.eachLimit(spec[name], 1, function (version, callback) {
-            logger.info({ module: name + '@' + version }, 'installing');
-            var verdir = path.join(verquire_dir, name, version);
-            var exists;
-            async.series([
-                function (callback) {
-                    // check if installation directory already exists
-                    fs.exists(verdir, function (result) {
-                        exists = result;
-                        callback();
-                    });
-                },
-                function (callback) {
-                    // remove directory if exists
-                    if (!exists)
-                        return callback();
-                    rmdir(verdir, callback);
-                },
-                function (callback) {
-                    // create directory structure for versioned module
-                    var structure = name.split('/');
-                    structure.push(version);
-                    structure.push('node_modules');
-                    var subpath = verquire_dir;
-                    async.eachSeries(structure, function (p, cb) {
-                        subpath = path.join(subpath, p);
-                        fs.mkdir(subpath, () => cb());
-                    }, callback);
-                },
-                function (callback) {
-                    // run npm to get the specific version
-                    var npm = spawn('npm', ['i', '--production', '--unsafe-perm', name + '@' + version], {
-                        env: process.env,
-                        cwd: verdir,
-                        stdio: 'inherit'
-                    });
-                    npm.once('close', function (code) {
-                        code ? npm.emit('done', new Error('npm exit code ' + code)) : npm.emit('done');
-                    });
-                    npm.once('error', function (e) { npm.emit('done', e); });
-                    npm.once('done', callback);
-                },
-                function (callback) {
-                    if (skipopt.indexOf(name + '@' + version) > -1) {
-                        // skip optimizing submodules of this module
-                        logger.info({
-                            module: name + '@' + version,
-                            path: verdir
-                        }, 'skipping inspecting dependencies');
-                        return callback();
-                    }
-                    // minimize size by reusing modules with symlinks
-                    glob('**/node_modules/*/package.json', {
-                        nodir: true,
-                        cwd: verdir
-                    }, function (error, list) {
-                        if (error)
-                            return callback(error);
 
-                        // sort by directory depth
-                        list.sort(function (a, b) {
-                          return a.split('/').length - b.split('/').length;
+    const install_all = () => {
+        async.eachLimit(Object.keys(spec), options.concurrent, function (name, callback) {
+            const install_version = (version, callback) => {
+                logger.info({ module: name + '@' + version }, 'installing');
+                var verdir = path.join(verquire_dir, name, version);
+
+                async.series([
+                    function (callback) {
+                        // create directory structure for versioned module
+                        var structure = name.split('/');
+                        structure.push(version);
+                        structure.push('node_modules');
+                        var subpath = verquire_dir;
+                        async.eachSeries(structure, function (p, cb) {
+                            subpath = path.join(subpath, p);
+                            fs.mkdir(subpath, () => cb());
+                        }, callback);
+                    },
+                    function (callback) {
+                        // run npm to get the specific version
+                        var npm = spawn(npm_bin, ['i', '--production', '--unsafe-perm', name + '@' + version], {
+                            env: process.env,
+                            cwd: verdir,
+                            stdio: 'inherit'
                         });
+                        npm.once('close', function (code) {
+                            code ? npm.emit('done', new Error('npm exit code ' + code)) : npm.emit('done');
+                        });
+                        npm.once('error', function (e) { npm.emit('done', e); });
+                        npm.once('done', callback);
+                    },
+                    function (callback) {
+                        if (skipopt.indexOf(name + '@' + version) > -1) {
+                            // skip optimizing submodules of this module
+                            logger.info({
+                                module: name + '@' + version,
+                                path: verdir
+                            }, 'skipping inspecting dependencies');
+                            return callback();
+                        }
+                        // minimize size by reusing modules with symlinks
+                        glob('**/node_modules/*/package.json', {
+                            nodir: true,
+                            cwd: verdir
+                        }, function (error, list) {
+                            if (error)
+                                return callback(error);
 
-                        logger.info({
-                            count: list.length,
-                            module: name + '@' + version,
-                            path: verdir
-                        }, 'inspecting dependencies');
+                            // sort by directory depth
+                            list.sort(function (a, b) {
+                            return a.split('/').length - b.split('/').length;
+                            });
 
-                        var exclude_paths = [];
-                        for (var i = 0; i < list.length; i++) {
-                            var package_file = list[i];
-                            var package_json = path.join(verdir, package_file);
-                            var module_path = path.join(package_json, '..');
-                            var exclude = false;
-                            for (var k = 0; k < exclude_paths.length; k++) {
-                                if (module_path === exclude_paths[k] || module_path.indexOf(exclude_paths[k]) === 0 && module_path[exclude_paths[k].length] === '/') {
-                                    exclude = true;
-                                    break;
+                            logger.info({
+                                count: list.length,
+                                module: name + '@' + version,
+                                path: verdir
+                            }, 'inspecting dependencies');
+
+                            var exclude_paths = [];
+                            for (var i = 0; i < list.length; i++) {
+                                var package_file = list[i];
+                                var package_json = path.join(verdir, package_file);
+                                var module_path = path.join(package_json, '..');
+                                var exclude = false;
+                                for (var k = 0; k < exclude_paths.length; k++) {
+                                    if (module_path === exclude_paths[k] || module_path.indexOf(exclude_paths[k]) === 0 && module_path[exclude_paths[k].length] === '/') {
+                                        exclude = true;
+                                        break;
+                                    }
                                 }
-                            }
-                            if (exclude) {
-                                // logger.error({
-                                //     module: package_file,
-                                //     dependency_of: name + '@' + version,
-                                //     exclude_paths: exclude_paths
-                                // }, 'skipping module symlinked at higher level');
-                                continue;
-                            }
-                            var json;
-                            try {
-                                json = require(package_json);
-                            }
-                            catch (e) {
-                                logger.warn({ package_json: package_json }, 'unable to read package.json');
-                                continue;
-                            }
-                            var module_name = json.name + '@' + json.version;
-
-                            if (cache[module_name]) {
-                                // module is already installed; create symlink
-                                try {
-                                    rmdir.sync(module_path);
-                                }
-                                catch (e) {
-                                    logger.warn({ 
-                                        module_path: module_path 
-                                    }, 'unable to remove path');
+                                if (exclude) {
+                                    // logger.error({
+                                    //     module: package_file,
+                                    //     dependency_of: name + '@' + version,
+                                    //     exclude_paths: exclude_paths
+                                    // }, 'skipping module symlinked at higher level');
                                     continue;
                                 }
+                                var json;
                                 try {
-                                    fs.symlinkSync(cache[module_name], module_path);
+                                    json = require(package_json);
                                 }
                                 catch (e) {
-                                    logger.warn({ 
-                                        error: e.message || e.toString(),
-                                        dest_module_path: module_path, 
+                                    logger.warn({ package_json: package_json }, 'unable to read package.json');
+                                    continue;
+                                }
+                                var module_name = json.name + '@' + json.version;
+
+                                if (cache[module_name]) {
+                                    // module is already installed; create symlink
+                                    try {
+                                        rmdir.sync(module_path);
+                                    }
+                                    catch (e) {
+                                        logger.warn({
+                                            module_path: module_path
+                                        }, 'unable to remove path');
+                                        continue;
+                                    }
+                                    try {
+                                        fs.symlinkSync(cache[module_name], module_path);
+                                    }
+                                    catch (e) {
+                                        logger.warn({
+                                            error: e.message || e.toString(),
+                                            dest_module_path: module_path,
+                                            src_module_path: cache[module_name]
+                                        }, 'unable to create symlink');
+                                        continue;
+                                    }
+                                    logger.info({
+                                        dest_module_path: module_path,
                                         src_module_path: cache[module_name]
-                                    }, 'unable to create symlink');
-                                    continue;                                    
+                                    }, 'created symlink');
+                                    // break the loop once we get to dependency modules
+                                    exclude_paths.push(module_path);
                                 }
-                                logger.info({ 
-                                    dest_module_path: module_path, 
-                                    src_module_path: cache[module_name]
-                                }, 'created symlink');
-                                // break the loop once we get to dependency modules
-                                exclude_paths.push(module_path);
-                            }
-                            else {
-                                // module not installed yet, apply fixups and add to cache
+                                else {
+                                    // module not installed yet, apply fixups and add to cache
 
-                                if (fixups[module_name]) {
-                                    logger.info({ 
-                                        name: module_name, 
-                                        path: module_path, 
-                                        fixup: fixups[module_name] 
-                                    }, 'applying fixups');
-                                    console.log(execSync(fixups[module_name], {
-                                        env: process.env,
-                                        cwd: module_path
-                                    }));
+                                    if (fixups[module_name]) {
+                                        logger.info({
+                                            name: module_name,
+                                            path: module_path,
+                                            fixup: fixups[module_name]
+                                        }, 'applying fixups');
+
+                                        var fixup_result = execSync(fixups[module_name], {
+                                            env: process.env,
+                                            cwd: module_path
+                                        });
+
+                                        logger.info({
+                                            name: module_name,
+                                            path: module_path,
+                                            fixup_result,
+                                        }, 'completed fixup');
+                                    }
+
+                                    logger.info({
+                                        module: module_name,
+                                        path: module_path
+                                    }, 'adding module to cache');
+                                    cache[module_name] = module_path;
                                 }
-
-                                logger.info({ 
-                                    module: module_name, 
-                                    path: module_path
-                                }, 'adding module to cache');
-                                cache[module_name] = module_path;
                             }
-                        }
-                        callback();
-                    });
-                },
-                function (callback) {
-                    // validate installation
-                    var test = tests[name] || ('require("' + name + '");');
-                    logger.info({ name: name, test: test }, 'testing module')
-                    var node = spawn('node', ['-e', test], {
-                        env: process.env,
-                        cwd: verdir,
-                        stdio: 'inherit'
-                    });
-                    node.once('close', function (code) {
-                        code ? node.emit('done', new Error('node exit code ' + code)) : node.emit('done');
-                    });
-                    node.once('error', function (e) { node.emit('done', e); });
-                    node.once('done', callback);
-                }
-            ], function (error) {
-                if (error) {
-                    logger.error({ 
-                        error: (error.message || error.stack || error.toString()),
-                        location: verdir,
-                        module: name + '@' + version
-                    }, 'error installing');
-                    errors[name] = errors[name] || {};
-                    errors[name][version] = error instanceof Error ? error.message : error;
-                    if (options.keep)
-                        return callback(options.error ? error : undefined);
-                    else
-                        rmdir(verdir, function () {
-                            // remove module subdirectory if empty
-                            fs.rmdir(path.join(verquire_dir, name), function () {
-                                callback(options.error ? error : undefined);
-                            });
+                            callback();
                         });
-                }
-                else {
-                    logger.info({
-                        module: name + '@' + version
-                    }, 'installed');
-                    callback();
-                }
-            });
-        }, callback);
-    }, function (error) {
-        if (error) {
-            logger.error(error);
-            process.exit(1);
-        }
-        if (Object.keys(errors).length > 0) {
-            logger.error({ count: Object.keys(errors).length }, 'some modules failed to install');
-            if (options.errors) {
-                logger.error({ error: options.error }, 'writing error file');
-                fs.writeFileSync(options.errors, JSON.stringify(errors, null, 2), 'utf8');
+                    },
+                    function (callback) {
+                        test_version(version, callback);
+                    }
+                ], function (error) {
+                    if (error) {
+                        logger.error({
+                            error: (error.message || error.stack || error.toString()),
+                            location: verdir,
+                            module: name + '@' + version
+                        }, 'error installing');
+                        errors[name] = errors[name] || {};
+                        errors[name][version] = error instanceof Error ? error.message : error;
+                        if (options.keep)
+                            return callback(options.error ? error : undefined);
+                        else
+                            rmdir(verdir, function () {
+                                // remove module subdirectory if empty
+                                fs.rmdir(path.join(verquire_dir, name), function () {
+                                    callback(options.error ? error : undefined);
+                                });
+                            });
+                    }
+                    else {
+                        logger.info({
+                            module: name + '@' + version
+                        }, 'installed');
+                        callback();
+                    }
+                });
+            };
+            const test_version = (version, callback) => {
+                // validate installation
+                var test = tests[name] || ('require("' + name + '");');
+                var verdir = path.join(verquire_dir, name, version);
+                logger.info({ name: name, test: test, verdir }, 'testing module')
+                var node = spawn(process.execPath, ['-e', test], {
+                    env: process.env,
+                    cwd: verdir,
+                    stdio: 'inherit'
+                });
+                node.once('close', function (code) {
+                    code ? node.emit('done', new Error('node exit code ' + code)) : node.emit('done');
+                });
+                node.once('error', function (e) { node.emit('done', e); });
+                node.once('done', callback);
+            };
 
+            return async.eachLimit(spec[name], 1, function (version, callback) {
+                var verdir = path.join(verquire_dir, name, version);
+
+                return fs.stat(verdir, (err, stats) => {
+                    if (err && err.code !== 'ENOENT' && !stats) {
+                        logger.error({ err, verdir }, 'error checking existence of directory');
+                        return callback(err);
+                    }
+
+                    if (stats) {
+                        if (!options.incremental) {
+                            return rmdir(verdir, { glob: false }, err => {
+                                if (err) {
+                                    logger.error({ err, verdir }, 'error removing old verquire module');
+                                    return callback(err);
+                                }
+
+                                return install_version(version, callback);
+                            });
+                        }
+
+                        logger.info({
+                            module: name + '@' + version,
+                        }, 'skipping module for incremental build');
+
+                        return test_version(version, callback);
+                    }
+
+                    return install_version(version, callback);
+                });
+            }, callback);
+        }, function (error) {
+            if (error) {
+                logger.error(error);
+                process.exit(1);
             }
-            else 
-                logger.error(errors, 'modules failed installing');
-            process.exit(2);
-        }
-        else {
-            fs.writeFileSync(path.join(verquire_dir, 'packages.json'), JSON.stringify(spec, null, 2), 'utf8');
-            logger.info('finished with no errors');
-        }
-    });
+            if (Object.keys(errors).length > 0) {
+                logger.error({ count: Object.keys(errors).length }, 'some modules failed to install');
+                if (options.errors) {
+                    logger.error({ error: options.error }, 'writing error file');
+                    fs.writeFileSync(options.errors, JSON.stringify(errors, null, 2), 'utf8');
+
+                }
+                else
+                    logger.error(errors, 'modules failed installing');
+                process.exit(2);
+            }
+            else {
+                fs.writeFileSync(path.join(verquire_dir, 'packages.json'), JSON.stringify(spec, null, 2), 'utf8');
+                logger.info('finished with no errors');
+            }
+        });
+    };
+
+    if (options.incremental) {
+        logger.info('seeding cache prior to incremental build');
+        // Build the initial cache state
+        return glob('**/node_modules/*/package.json', {
+            nodir: true,
+            follow: false,
+            cwd: verquire_dir,
+        }, function (err, list) {
+            if (err) {
+                logger.error(err);
+                return process.exit(1);
+            }
+
+            list.forEach(relpath => {
+                var package_json = path.join(verquire_dir, relpath);
+                var json;
+                try {
+                    json = require(package_json);
+                }
+                catch (e) {
+                    logger.warn({ package_json: package_json }, 'unable to read package.json');
+                    return;
+                }
+                var module_name = `${json.name}@${json.version}`;
+                var module_path = path.dirname(package_json);
+                logger.info({
+                    module: module_name,
+                    path: module_path,
+                }, 'adding module to cache');
+                cache[module_name] = module_path;
+            });
+
+            return install_all();
+        });
+    }
+
+    install_all();
 }
 
 function blacklist_action(options) {
     options.spec = options.spec || path.join(__dirname, 'packages.json');
 
-    logger.info({ 
-        spec: options.spec, 
+    logger.info({
+        spec: options.spec,
         blacklist: options.blacklist
     }, 'blacklist-spec start');
 
@@ -411,8 +500,8 @@ function blacklist_action(options) {
 function update_action(options) {
     options.spec = options.spec || path.join(__dirname, 'packages.json');
 
-    logger.info({ 
-        spec: options.spec, 
+    logger.info({
+        spec: options.spec,
         concurrent: options.concurrent
     }, 'udpate-spec start');
 
@@ -423,7 +512,7 @@ function update_action(options) {
         async.series([
             function (callback) {
                 // run npm to get the the spec version
-                var npm = spawn('npm', ['view', name, '--json'], {
+                var npm = spawn(npm_bin, ['view', name, '--json'], {
                     env: process.env,
                     stdio: [process.stdin, 'pipe', process.stderr]
                 });
@@ -449,15 +538,15 @@ function update_action(options) {
                     }
                 }
                 if (present) {
-                    logger.info({ 
-                        latest: npm_info.version, 
-                        module: name 
+                    logger.info({
+                        latest: npm_info.version,
+                        module: name
                     }, 'module is up to date');
                 }
                 else {
-                    logger.info({ 
-                        latest: npm_info.version, 
-                        module: name 
+                    logger.info({
+                        latest: npm_info.version,
+                        module: name
                     }, 'adding latest module version');
                     spec[name].unshift(npm_info.version);
                 }
@@ -465,7 +554,7 @@ function update_action(options) {
             },
         ], function (error) {
             if (error) {
-                logger.error({ 
+                logger.error({
                     error: (error.message || error.stack || error.toString()),
                     module: name
                 }, 'error inspecting a module');
